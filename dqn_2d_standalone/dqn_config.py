@@ -17,7 +17,8 @@ from dataclasses import dataclass, fields
 @dataclass
 class DQNConfig:
     # ── Network architecture ──
-    state_dim: int = 5
+    # state_dim is NOT a field any more: it is derived (see property at the
+    # bottom of this class) from num_obstacles / k_nearest.
     num_actions: int = 3
     hidden_dim: int = 128  # raised from 64 -- testing whether network
                             # capacity was the bottleneck (see experiment log)
@@ -40,6 +41,21 @@ class DQNConfig:
     target_update_every: int = 10
     resume_epsilon: float = 0.3  # epsilon restart value on --resume_from
                                   # (neither 1.0 nor epsilon_min)
+
+    # ── Obstacles / state (2D standalone env; ground-truth coordinates) ──
+    num_obstacles: int = 0        # 0 = Stage 0 (state is just [dx, dy])
+    k_nearest: int = 3            # obstacles exposed to the network (nearest first)
+    obstacle_radius: float = 0.5  # m, circular obstacles
+    drone_radius: float = 0.2     # m, crash if centre distance < obstacle_radius + drone_radius
+    obstacle_clearance: float = 0.5   # m, extra spawn gap around start and target
+    first_obstacle_on_path: int = 1   # 1 = obstacle #0 is spawned on the start->target segment
+    sense_range: float = 10.0     # m, obstacles whose surface is farther than this are invisible
+    state_scale: float = 10.0     # state is divided by this (1.0 = old unnormalised scale)
+
+    @property
+    def state_dim(self) -> int:
+        """[dx, dy] + 3 numbers (ox, oy, radius) per exposed obstacle."""
+        return 2 + 3 * min(self.k_nearest, self.num_obstacles)
 
 
 def add_config_args(parser: argparse.ArgumentParser) -> None:

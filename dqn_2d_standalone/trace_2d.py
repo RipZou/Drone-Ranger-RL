@@ -37,8 +37,14 @@ state = obs_dict["dqn_state"]
 print(f"[TRACE] start={env.pos[0].tolist()}  target={env.target[0].tolist()}")
 print()
 
+# [obstacles-patch]
 header = (f"{'step':>5} {'action':>10} {'pos_x':>7} {'pos_y':>7} {'d(pos)':>7} "
-          f"{'dist':>7} {'yaw_cos':>8} {'vx':>7} {'r_progress':>10} {'r_total':>8}")
+          f"{'dist':>7} {'d_obs':>7} {'yaw_cos':>8} {'vx':>7} {'r_progress':>10} {'r_total':>8}")
+if env.num_obstacles > 0:
+    print("[TRACE] obstacles (world x, y; r=%.2f):" % cfg.obstacle_radius,
+          [(round(o[0], 2), round(o[1], 2)) for o in env.obs_pos[0].tolist() if abs(o[0]) < 1e3])
+    print("[TRACE] d_obs = distance from the drone to the NEAREST obstacle SURFACE (crash when < %.2f)" % cfg.drone_radius)
+    print()
 print(header)
 print("-" * len(header))
 
@@ -51,13 +57,20 @@ for step in range(args.max_steps):
     obs_dict, reward, terminated, truncated, info = env.step(actions_continuous)
     state = obs_dict["dqn_state"]
 
-    # Recompute the breakdown for THIS step using the env's internal state
-    # (step() already advanced pos/yaw, so this reflects the post-step
-    # state exactly as the reward was computed for it).
+    # step() auto-resets finished envs. Swap in the pre-reset snapshot so every
+    # number below (including the LAST row of an episode) describes the real
+    # post-move state, then swap the live state back.
+    live = (env.pos, env.yaw, env.target, env.obs_pos)
+    env.pos, env.yaw, env.target, env.obs_pos = env._pre_reset
+
     rel = env.target - env.pos
     dist_now = torch.norm(rel, dim=-1)
+    if env.num_obstacles > 0:
+        d_obs = (torch.norm(env.obs_pos - env.pos[:, None, :], dim=-1) - cfg.obstacle_radius).min().item()
+    else:
+        d_obs = float("nan")
     _, breakdown = env._compute_reward(dist_now, actions_continuous,
-                                        env._last_reached_flag, torch.zeros_like(env._last_reached_flag),
+                                        env._last_reached_flag, env._last_any_contact,
                                         return_breakdown=True)  # vx_signed re-derived internally, fine for tracing
 
     new_pos = env.pos[0].clone()
@@ -66,12 +79,19 @@ for step in range(args.max_steps):
 
     print(f"{step:>5} {ACTION_NAMES[action_idx[0].item()]:>10} "
           f"{env.pos[0,0].item():>7.3f} {env.pos[0,1].item():>7.3f} {pos_delta:>7.4f} "
-          f"{dist_now[0].item():>7.3f} {breakdown['yaw_cos'][0].item():>8.3f} "
+          f"{dist_now[0].item():>7.3f} {d_obs:>7.3f} {breakdown['yaw_cos'][0].item():>8.3f} "
           f"{breakdown['vx_signed'][0].item():>7.3f} {breakdown['rew_progress'][0].item():>10.4f} "
           f"{reward[0].item():>8.4f}")
+    env.pos, env.yaw, env.target, env.obs_pos = live
 
     if (terminated | truncated)[0].item():
-        outcome = "reached" if env._last_reached_flag[0].item() else \
-                   ("out_of_bounds" if env._last_out_of_bounds[0].item() else "timed_out")
+        if env._last_reached_flag[0].item():
+            outcome = "reached"
+        elif env._last_any_contact[0].item():
+            outcome = "crashed"
+        elif env._last_out_of_bounds[0].item():
+            outcome = "out_of_bounds"
+        else:
+            outcome = "timed_out"
         print(f"\n[TRACE] episode ended at step {step}, outcome={outcome}")
         break

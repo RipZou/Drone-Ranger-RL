@@ -17,7 +17,8 @@ from dqn_config import DQNConfig, add_config_args, config_from_args
 from dqn_action_space import QNetwork, ACTION_NAMES
 
 
-def sweep(checkpoint_path: str, cfg: DQNConfig, distances, angle_step_deg: float, device: str):
+def sweep(checkpoint_path: str, cfg: DQNConfig, distances, angle_step_deg: float, device: str,
+          obstacle_body=None):  # [obstacles-patch]
     q_net = QNetwork(state_dim=cfg.state_dim, action_dim=cfg.num_actions, hidden_dim=cfg.hidden_dim)
     q_net.load_state_dict(torch.load(checkpoint_path, map_location=device))
     q_net.to(device)
@@ -25,9 +26,31 @@ def sweep(checkpoint_path: str, cfg: DQNConfig, distances, angle_step_deg: float
 
     angles_deg = torch.arange(-180.0, 180.0 + 1e-6, angle_step_deg)
 
+    # Number of obstacle slots in the state. obstacle_body = (x, y) in metres,
+    # body frame (x forward, y left); it fills slot 0, other slots are empty.
+    k = min(cfg.k_nearest, cfg.num_obstacles)
+    if k == 0 and obstacle_body is not None:
+        print('[warn] --obstacle_body ignored: this config has num_obstacles=0')
+
+    def make_state(dx, dy):
+        row = [dx, dy]
+        for slot in range(k):
+            if slot == 0 and obstacle_body is not None:
+                row += [obstacle_body[0], obstacle_body[1], cfg.obstacle_radius]
+            else:
+                row += [cfg.sense_range, 0.0, 0.0]   # empty slot
+        return [v / cfg.state_scale for v in row]
+
+    if k == 0:
+        scenario = 'no obstacle in state'
+    elif obstacle_body is not None:
+        scenario = f'obstacle at body-frame ({obstacle_body[0]:.1f}, {obstacle_body[1]:.1f}) m, r={cfg.obstacle_radius}'
+    else:
+        scenario = 'all obstacle slots empty'
+
     for dist in distances:
         print("=" * 100)
-        print(f"distance = {dist:.1f}m   (d_front=d_left=d_right=10.0, no-obstacle scenario)")
+        print(f"distance = {dist:.1f}m   ({scenario})")
         print("=" * 100)
         col_headers = "   ".join(f"Q{i}({ACTION_NAMES[i]})" for i in range(cfg.num_actions))
         print(f"{'heading':>8}   {col_headers}   {'argmax':<12} {'top1 margin':>12}")
@@ -38,7 +61,7 @@ def sweep(checkpoint_path: str, cfg: DQNConfig, distances, angle_step_deg: float
             ang_rad = math.radians(float(ang_deg))
             dx = dist * math.cos(ang_rad)
             dy = dist * math.sin(ang_rad)
-            states.append([10.0, 10.0, 10.0, dx, dy])
+            states.append(make_state(dx, dy))
         state_tensor = torch.tensor(states, dtype=torch.float32, device=device)
 
         with torch.no_grad():
@@ -74,8 +97,11 @@ if __name__ == "__main__":
     parser.add_argument("--angle_step_deg", type=float, default=5.0,
                          help="angular sweep step size in degrees, default 5")
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--obstacle_body", type=float, nargs=2, default=None, metavar=("X", "Y"),
+                         help="place one obstacle at (X, Y) metres in the body frame (x forward, y left), "
+                              "e.g. --obstacle_body 2 0 = 2 m straight ahead")
     add_config_args(parser)
     args = parser.parse_args()
     cfg: DQNConfig = config_from_args(args)
 
-    sweep(args.checkpoint, cfg, args.distances, args.angle_step_deg, args.device)
+    sweep(args.checkpoint, cfg, args.distances, args.angle_step_deg, args.device, args.obstacle_body)
