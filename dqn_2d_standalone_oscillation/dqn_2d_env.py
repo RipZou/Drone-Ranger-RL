@@ -84,6 +84,11 @@ CAMERA_NAMES = ("fr", "fl")
 GROUND_TRUTH_SECTORS = tuple(
     (cam + SENSOR_HALF_FOV * (2 * b + 1 - CAMERA_BINS) / CAMERA_BINS, SENSOR_HALF_FOV / CAMERA_BINS)
     for cam in CAMERA_OFFSETS for b in range(CAMERA_BINS))
+# One camera on the heading (camera_count 1): CAMERA_BINS sectors tiling its 73 deg, right to left.
+SINGLE_CAMERA_SECTORS = tuple(
+    (SENSOR_HALF_FOV * (2 * b + 1 - CAMERA_BINS) / CAMERA_BINS, SENSOR_HALF_FOV / CAMERA_BINS)
+    for b in range(CAMERA_BINS))
+SECTORS_BY_CAMERA_COUNT = {1: SINGLE_CAMERA_SECTORS, 2: GROUND_TRUTH_SECTORS}
 DISTANCE_MODES = ("ground_truth", "camera", "coords")
 DEFAULT_K_NEAREST = 3
 PREV_ACTION_DIM = 3 + len(SPEED_FRACTIONS)
@@ -118,7 +123,12 @@ class DroneNav2DEnv:
         self.distance_mode = distance_mode
         self.k_nearest = k_nearest
         # Networks are sized from this, not from cfg.state_dim, because coords mode changes it.
-        self.num_readings = {"coords": 3 * k_nearest, "ground_truth": len(GROUND_TRUTH_SECTORS), "camera": 3}[distance_mode]
+        if cfg.camera_count not in SECTORS_BY_CAMERA_COUNT:
+            raise ValueError(f"camera_count must be 1 or 2, got {cfg.camera_count}")
+        if cfg.camera_count != 2 and distance_mode != "ground_truth":
+            raise ValueError("camera_count 1 is only implemented for distance_mode ground_truth")
+        self.sectors = SECTORS_BY_CAMERA_COUNT[cfg.camera_count]
+        self.num_readings = {"coords": 3 * k_nearest, "ground_truth": len(self.sectors), "camera": 3}[distance_mode]
         self.state_dim = self.num_readings + PREV_ACTION_DIM + SIMILARITY_OBS_DIM + 2
         # One-hot of the last turn (none, left, right) followed by a one-hot of the last speed,
         # all zeros on an episode's first step.
@@ -240,9 +250,11 @@ class DroneNav2DEnv:
             d = torch.full((self.num_envs, self.num_readings), MAX_SENSE_RANGE, device=self.device)
         elif self.distance_mode == "ground_truth":
             d = obstacle_sector_distances(self.pos, self.yaw, *obstacles, SENSOR_HALF_FOV, MAX_SENSE_RANGE,
-                                          sectors=GROUND_TRUTH_SECTORS)
+                                          sectors=self.sectors)
         else:
             d = camera_readings(self.pos, self.yaw, *obstacles)
+        if self.cfg.sensor_min_range > 0 and self.distance_mode != "coords":
+            d = d.clamp(min=self.cfg.sensor_min_range)
 
         state = torch.cat([d, self.prev_action, self.pose_delta, dx.unsqueeze(-1), dy.unsqueeze(-1)], dim=-1)
         return {"dqn_state": state}, dist
@@ -471,6 +483,150 @@ def add_env_args(parser):
                         help="obstacle slots in the state, coords mode only")
 
 
+def inertia_enabled(cfg):
+    return (cfg.inertia_tau_max > 0 or cfg.inertia_accel_max > 0 or cfg.inertia_delay_max > 0
+            or bool(cfg.obs_velocity))
+
+
 def env_from_args(args, num_envs, cfg, device):
-    return DroneNav2DEnv(num_envs=num_envs, cfg=cfg, device=device, num_obstacles=args.num_obstacles,
-                         distance_mode=args.distance_mode, k_nearest=args.k_nearest)
+    cls = InertialDroneNav2DEnv if inertia_enabled(cfg) else DroneNav2DEnv
+    return cls(num_envs=num_envs, cfg=cfg, device=device, num_obstacles=args.num_obstacles,
+               distance_mode=args.distance_mode, k_nearest=args.k_nearest)
+
+
+class InertialDroneNav2DEnv(DroneNav2DEnv):
+    """DroneNav2DEnv whose drone cannot follow its commands at once.
+
+    Per substep of DT / inertia_substeps: the yaw rate is the applied command; the world-frame velocity
+    vector moves toward speed * heading by a fraction dt / tau, its change capped at accel * dt, so the drone
+    keeps its momentum and slides outward in a turn; the position integrates that velocity; contact is
+    checked, and a drone that touches an obstacle stops there. The command applied is the one chosen delay
+    decisions earlier, hover (zeros) before then. Each episode starts at rest and draws tau, accel and delay
+    from the config ranges. With every range at 0 and inertia_substeps 1 the motion is exactly the parent's.
+
+    Everything after the move mirrors DroneNav2DEnv.step() of commit 6ea51cf. The state still shows the
+    command the policy chose, and, with obs_velocity, the actual body-frame velocity as two more inputs.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        c, n, dev = self.cfg, self.num_envs, self.device
+        if not (0 <= c.inertia_tau_min <= c.inertia_tau_max and 0 <= c.inertia_accel_min <= c.inertia_accel_max
+                and 0 <= c.inertia_delay_min <= c.inertia_delay_max and c.inertia_substeps >= 1):
+            raise ValueError("inertia ranges need 0 <= min <= max and inertia_substeps >= 1")
+        if c.inertia_accel_max > 0 and c.inertia_accel_min == 0:
+            raise ValueError("inertia_accel_min must be > 0 when an acceleration cap is set")
+        self.obs_velocity = bool(c.obs_velocity)
+        if self.obs_velocity:
+            self.state_dim += 2
+        self.substeps = c.inertia_substeps
+        self.max_delay = c.inertia_delay_max
+        self._gen = torch.Generator()
+        self._gen.manual_seed(c.inertia_seed)
+        self.vel = torch.zeros(n, 2, device=dev)
+        self.cmd_buf = torch.zeros(n, self.max_delay, 2, device=dev)  # (speed, yaw rate) not yet applied, oldest first
+        self.tau = torch.zeros(n, device=dev)
+        self.accel = torch.full((n,), math.inf, device=dev)
+        self.delay = torch.zeros(n, dtype=torch.long, device=dev)
+        self._draw_dynamics(torch.arange(n, device=dev))
+
+    def _draw_dynamics(self, env_ids):
+        c, k = self.cfg, len(env_ids)
+        u = lambda lo, hi: (lo + (hi - lo) * torch.rand(k, generator=self._gen)).to(self.device)
+        self.tau[env_ids] = u(c.inertia_tau_min, c.inertia_tau_max)
+        accel = u(c.inertia_accel_min, c.inertia_accel_max)
+        self.accel[env_ids] = accel if c.inertia_accel_max > 0 else torch.full_like(accel, math.inf)
+        self.delay[env_ids] = torch.randint(c.inertia_delay_min, c.inertia_delay_max + 1, (k,),
+                                            generator=self._gen).to(self.device)
+
+    def _sample_positions(self, env_ids):
+        super()._sample_positions(env_ids)
+        if hasattr(self, "vel"):  # not yet while the parent's __init__ runs
+            self.vel[env_ids] = 0.0
+            self.cmd_buf[env_ids] = 0.0
+            self._draw_dynamics(env_ids)
+
+    def _get_obs(self):
+        obs, dist = super()._get_obs()
+        if self.obs_velocity:
+            c, s = torch.cos(self.yaw), torch.sin(self.yaw)
+            body = torch.stack([self.vel[:, 0] * c + self.vel[:, 1] * s, -self.vel[:, 0] * s + self.vel[:, 1] * c], dim=-1)
+            obs = {"dqn_state": torch.cat([obs["dqn_state"], body], dim=-1)}
+        return obs, dist
+
+    def _surface_dist(self):
+        if self.num_obstacles == 0:
+            return torch.full((self.num_envs,), math.inf, device=self.device)
+        return obstacle_surface_distance(self.pos, self.obstacle_xy[:, :NUM_CYLINDERS], self._circle_r,
+                                         self.obstacle_xy[:, NUM_CYLINDERS:], self._box_half)
+
+    def step(self, actions_continuous: torch.Tensor):
+        vx_cmd = ((torch.tanh(actions_continuous[:, 0]) + 1.0) / 2.0) * self.cfg.max_xy_vel
+        yaw_rate_cmd = torch.tanh(actions_continuous[:, 2]) * self.cfg.max_yaw_rate
+        pos_before = self.pos.clone()
+        dist_before = torch.norm(self.target - self.pos, dim=-1)
+
+        rows = torch.arange(self.num_envs, device=self.device)
+        full = torch.cat([self.cmd_buf, torch.stack([vx_cmd, yaw_rate_cmd], dim=-1)[:, None]], dim=1)
+        applied = full[rows, self.max_delay - self.delay]
+        self.cmd_buf = full[:, 1:]
+        v_app, w_app = applied[:, 0], applied[:, 1]
+
+        dts = DT / self.substeps
+        k_v = torch.where(self.tau > 0, (dts / self.tau.clamp(min=1e-9)).clamp(max=1.0), torch.ones_like(self.tau))
+        cap = (self.accel * dts)[:, None]
+        contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        hit_speed = torch.zeros(self.num_envs, device=self.device)
+        for _ in range(self.substeps):
+            live = ~contact
+            new_yaw = self.yaw + w_app * dts
+            self.yaw = torch.where(live, torch.atan2(torch.sin(new_yaw), torch.cos(new_yaw)), self.yaw)
+            v_target = torch.stack([v_app * torch.cos(self.yaw), v_app * torch.sin(self.yaw)], dim=-1)
+            dv = (v_target - self.vel) * k_v[:, None]
+            dv = dv * (cap / dv.norm(dim=-1, keepdim=True).clamp(min=1e-9)).clamp(max=1.0)
+            self.vel = torch.where(live[:, None], self.vel + dv, self.vel)
+            self.pos = torch.where(live[:, None], self.pos + self.vel * dts, self.pos)
+            new_contact = live & (self._surface_dist() < DRONE_RADIUS)
+            hit_speed = torch.where(new_contact, self.vel.norm(dim=-1), hit_speed)
+            contact |= new_contact
+
+        # ---- as in DroneNav2DEnv.step() ----
+        self.step_count += 1
+        self._update_pose_similarity()
+        turn = torch.sign(yaw_rate_cmd)
+        speeds = torch.tensor(SPEED_FRACTIONS, device=self.device) * self.cfg.forward_speed
+        speed = (vx_cmd.unsqueeze(-1) - speeds).abs().argmin(dim=-1)
+        self.prev_action = torch.cat([torch.stack([turn == 0, turn > 0, turn < 0], dim=-1).float(),
+                                      torch.nn.functional.one_hot(speed, len(SPEED_FRACTIONS)).float()], dim=-1)
+
+        obs_dict, dist = self._get_obs()
+        reached = dist < REACHED_THRESHOLD
+        out_of_bounds = dist > OUT_OF_BOUNDS_DIST
+        timed_out = self.step_count >= self.max_steps
+        surface_dist = self._surface_dist()
+        crashed = contact | (surface_dist < DRONE_RADIUS)
+        terminated = reached | crashed
+        truncated = out_of_bounds | timed_out
+        self._last_reached_flag = reached
+        self._last_ground_crash = torch.zeros_like(reached)
+        self._last_any_contact = crashed
+        self._last_out_of_bounds = out_of_bounds
+
+        sensor_dist = obs_dict["dqn_state"][:, :self.num_readings].min(dim=-1).values
+        # The distance actually travelled, not the command, scales the proximity penalty (proximity_travel_ref).
+        travel_speed = (self.pos - pos_before).norm(dim=-1) / DT
+        reward, self.last_reward_breakdown = self._compute_reward(
+            dist, actions_continuous, reached, crashed, vx_signed=travel_speed, surface_dist=surface_dist,
+            sensor_dist=sensor_dist, dist_before=dist_before, return_breakdown=True)
+
+        self.pre_reset_state = {
+            "pos": self.pos.clone(), "yaw": self.yaw.clone(), "target": self.target.clone(),
+            "obstacle_xy": self.obstacle_xy.clone(), "obstacle_active": self.obstacle_active.clone(),
+            "speed": torch.where(contact, hit_speed, self.vel.norm(dim=-1)),
+        }
+        done = terminated | truncated
+        reset_obs = obs_dict
+        if done.any():
+            self._sample_positions(done.nonzero(as_tuple=True)[0])
+            reset_obs, _ = self._get_obs()
+        return obs_dict, reward, terminated, truncated, {"reset_obs": reset_obs}

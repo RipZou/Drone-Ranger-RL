@@ -101,6 +101,30 @@ class DQNConfig:
     proximity_travel_ref: float = 0.15
     # Decoupled weight decay through AdamW. 0 keeps plain Adam.
     weight_decay: float = 1e-3
+    # ── Inertia (InertialDroneNav2DEnv in dqn_2d_env.py). All off by default, which keeps the instant
+    # kinematics of baseline_stop_v7.8. Each episode draws its own values uniformly from [min, max], from a
+    # generator of its own seeded by inertia_seed, so the layouts drawn from the global seed do not change.
+    # The world-frame velocity vector follows speed * heading with time constant tau (s), its change capped
+    # at accel (m/s^2, 0 = no cap), and every command takes effect delay decision steps (0.1 s each) late.
+    # Isaac Lab's velocity controller (vel_ctrl_kp 4, max_accel 6) is about tau 0.25 and accel 6.
+    inertia_tau_min: float = 0.0
+    inertia_tau_max: float = 0.0
+    inertia_accel_min: float = 0.0
+    inertia_accel_max: float = 0.0
+    inertia_delay_min: int = 0
+    inertia_delay_max: int = 0
+    inertia_substeps: int = 5  # motion and contact are integrated in this many substeps of each 0.1 s step
+    inertia_seed: int = 12345
+    # 1 appends the body-frame velocity (forward, left) in m/s to the state, 2 more inputs. Changes state_dim,
+    # so a checkpoint trained without it does not load.
+    obs_velocity: int = 0
+    # Depth cameras in ground_truth mode: 2 = two 73 deg cameras yawed +/-36.5 deg (146 deg, baseline_stop_v7.8),
+    # 1 = one 73 deg camera on the heading (a single OAK-D Lite). Each gives CAMERA_BINS readings, so 1 camera
+    # shrinks state_dim by 5 and a checkpoint trained with the other count does not load.
+    camera_count: int = 2
+    # Readings closer than this (m) report this value, as a stereo camera cannot resolve depth that close
+    # (OAK-D Lite: about 0.2 m at 400P with extended disparity, 0.4 m otherwise). 0 = no limit.
+    sensor_min_range: float = 0.0
 
 
 def add_config_args(parser: argparse.ArgumentParser) -> None:
